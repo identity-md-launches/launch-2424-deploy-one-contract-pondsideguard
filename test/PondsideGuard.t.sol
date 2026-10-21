@@ -70,6 +70,75 @@ contract PondsideGuardRegistrationTest is PondsideFixture {
         assertEq(hook.windowEndsAt(poolId), 0, "a reverted first swap does not open the window");
     }
 
+    /// @dev A pool with no liquidity accepts swaps that fill nothing. Such a swap must not start the window,
+    /// or a stranger could expire the cap before trading really opens.
+    function test_swapThatMovesNothingDoesNotOpenWindow() public {
+        // A fresh pool on a fresh hook, initialized but without liquidity.
+        token = new BurnableToken();
+        token.mint(lp, TOKEN_SUPPLY);
+        (deployer, hook) = deployHook(recipient);
+        key = poolKeyFor(address(token), hook);
+        poolId = key.toId();
+        manager.initialize(key, SQRT_PRICE_1_1);
+        address griefer = makeAddr("griefer");
+        vm.deal(griefer, 10 ether);
+
+        // A 1-wei buy (no fee, no simulation) and a 1-ether buy (simulated, fills nothing) both succeed, as
+        // does a sell request the empty pool cannot fill. (An empty pool's price slides to each swap's limit,
+        // so the limits stay next to 1:1 for the liquidity added below.)
+        buyExactInLimited(griefer, 1, SQRT_PRICE_1_1 - 1);
+        buyExactInLimited(griefer, 1 ether, SQRT_PRICE_1_1 - 2);
+        sellExactOutLimited(griefer, 1 ether, SQRT_PRICE_1_1);
+        assertEq(token.balanceOf(griefer), 0, "nothing moved");
+        assertEq(currentSqrtPrice(), SQRT_PRICE_1_1);
+        assertEq(hook.windowEndsAt(poolId), 0, "an empty swap does not open the window");
+        assertTrue(hook.windowOpen(poolId), "the cap is still pending");
+        assertEq(hook.jar(poolId), 0);
+
+        // Liquidity arrives ten minutes later: the first real buyer is still capped.
+        vm.warp(block.timestamp + 10 minutes);
+        addFullRangeLiquidity(lp, POOL_LIQUIDITY);
+        uint256 cap = hook.buyCap(poolId);
+        vm.startPrank(alice, alice);
+        vm.expectRevert(
+            wrapped(
+                hook,
+                IHooks.afterSwap.selector,
+                abi.encodeWithSelector(PondsideGuard.BuyCapExceeded.selector, alice, cap * 5, cap)
+            )
+        );
+        swapRouter.swap{value: 20_000 ether}(
+            key,
+            SwapParams({
+                zeroForOne: true, amountSpecified: int256(cap * 5), sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
+            }),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+        vm.stopPrank();
+        assertEq(hook.windowEndsAt(poolId), 0, "a reverted swap does not open the window");
+
+        // The first filled swap opens the window and is itself counted against the cap.
+        vm.expectEmit(true, false, false, true, address(hook));
+        emit PondsideGuard.WindowOpened(poolId, block.timestamp + 10 minutes);
+        buyExactOut(alice, cap, 20_000 ether);
+        assertEq(hook.windowEndsAt(poolId), block.timestamp + 10 minutes);
+        assertEq(hook.boughtDuringWindow(poolId, alice), cap);
+        vm.expectRevert();
+        buyExactOut(alice, 1, 1 ether);
+    }
+
+    function test_firstFilledSellOpensWindowToo() public {
+        vm.startPrank(lp, lp);
+        token.transfer(alice, 10 ether);
+        vm.stopPrank();
+        vm.expectEmit(true, false, false, true, address(hook));
+        emit PondsideGuard.WindowOpened(poolId, block.timestamp + 10 minutes);
+        sellExactIn(alice, 10 ether);
+        assertEq(hook.windowEndsAt(poolId), block.timestamp + 10 minutes);
+        assertEq(hook.boughtDuringWindow(poolId, alice), 0, "a sell is not a buy");
+    }
+
     function test_secondPoolRegistersWithItsOwnState() public {
         BurnableToken other = new BurnableToken();
         other.mint(lp, TOKEN_SUPPLY);

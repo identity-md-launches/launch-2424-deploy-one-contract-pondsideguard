@@ -30,7 +30,7 @@ interface IPoolToken {
 ///   1. takes 1% of the ETH side of every swap as a fee for `feeRecipient`, paid inside the swap (or minted as an
 ///      ERC-6909 claim the hook holds for the recipient when the PoolManager cannot pay it directly);
 ///   2. caps each wallet (`tx.origin`) at 1% of the token's total supply bought during the first 10 minutes of
-///      trading (the window opens with the pool's first swap);
+///      trading (the window opens with the pool's first swap that moves value, and that swap is capped too);
 ///   3. takes another 1% of the ETH side into the pool's jar and, once the jar holds at least 0.1 ETH, buys the
 ///      pool's token from the pool with the jar and burns it (automatically after the swap that filled the jar
 ///      when that succeeds, otherwise through `buyback(poolId)` which anyone may call);
@@ -97,7 +97,7 @@ contract PondsideGuard is IHooks, IUnlockCallback {
         uint24 fee;
         int24 tickSpacing;
         bool initialized;
-        /// @dev Timestamp at which the buy-cap window closes; zero until the pool's first swap.
+        /// @dev Timestamp at which the buy-cap window closes; zero until the pool's first swap that moves value.
         uint64 windowEndsAt;
         /// @dev Automatic buyback attempts are skipped before this timestamp.
         uint64 nextAutoBuybackAt;
@@ -322,9 +322,9 @@ contract PondsideGuard is IHooks, IUnlockCallback {
     }
 
     /// @inheritdoc IHooks
-    /// @dev Opens the buy-cap window on the pool's first swap and records the block's reference price. When ETH
-    /// is the specified currency (exact-input buy, exact-output sell) the fee is charged here as a positive
-    /// specified delta computed from the ETH the pool will actually move, found by simulating the swap.
+    /// @dev Records the block's reference price. When ETH is the specified currency (exact-input buy,
+    /// exact-output sell) the fee is charged here as a positive specified delta computed from the ETH the pool
+    /// will actually move, found by simulating the swap.
     function beforeSwap(address, PoolKey calldata key, SwapParams calldata params, bytes calldata)
         external
         onlyPoolManager
@@ -334,10 +334,6 @@ contract PondsideGuard is IHooks, IUnlockCallback {
         PoolId poolId = key.toId();
         PoolState storage p = _pool(poolId);
         _touchReference(poolId, p);
-        if (p.windowEndsAt == 0) {
-            p.windowEndsAt = uint64(block.timestamp + BUY_WINDOW);
-            emit WindowOpened(poolId, p.windowEndsAt);
-        }
 
         int128 specified;
         if (_ethIsSpecified(params)) {
@@ -352,7 +348,8 @@ contract PondsideGuard is IHooks, IUnlockCallback {
     }
 
     /// @inheritdoc IHooks
-    /// @dev Settles both fee shares, enforces the buy cap and attempts the automatic buyback.
+    /// @dev Opens the buy-cap window on the pool's first swap that moves value, settles both fee shares,
+    /// enforces the buy cap and attempts the automatic buyback.
     function afterSwap(address, PoolKey calldata key, SwapParams calldata params, BalanceDelta delta, bytes calldata)
         external
         onlyPoolManager
@@ -379,6 +376,12 @@ contract PondsideGuard is IHooks, IUnlockCallback {
             unspecified = (fee + jarCut).toInt128();
         }
 
+        // The window opens with the first swap that moves value. A swap the pool cannot fill (no liquidity, or
+        // a price limit already reached) leaves both deltas at zero and does not count as the pool opening.
+        if (p.windowEndsAt == 0 && (eth != 0 || delta.amount1() != 0)) {
+            p.windowEndsAt = uint64(block.timestamp + BUY_WINDOW);
+            emit WindowOpened(poolId, p.windowEndsAt);
+        }
         if (params.zeroForOne) _enforceBuyCap(poolId, p, delta.amount1());
         _collect(poolId, p, fee, jarCut);
 
@@ -469,14 +472,15 @@ contract PondsideGuard is IHooks, IUnlockCallback {
         return Currency.unwrap(_pools[poolId].token);
     }
 
-    /// @notice Timestamp at which the pool's per-wallet buy-cap window closes (first swap + 10 minutes), or zero
-    /// while the pool has not traded yet.
+    /// @notice Timestamp at which the pool's per-wallet buy-cap window closes (first value-moving swap + 10
+    /// minutes), or zero while the pool has not traded yet. A swap that fills nothing (no liquidity) does not
+    /// open it.
     function windowEndsAt(PoolId poolId) external view returns (uint256) {
         return _pools[poolId].windowEndsAt;
     }
 
     /// @notice Whether the per-wallet buy cap is in force on the pool: from registration until 10 minutes after
-    /// its first swap.
+    /// its first swap that moves value.
     function windowOpen(PoolId poolId) external view returns (bool) {
         PoolState storage p = _pools[poolId];
         return p.initialized && (p.windowEndsAt == 0 || block.timestamp < p.windowEndsAt);
@@ -650,8 +654,11 @@ contract PondsideGuard is IHooks, IUnlockCallback {
         return _feesFromGross(gross);
     }
 
+    /// @dev The cap is in force from registration until the window has run: an unopened window (zero) counts as
+    /// open, so the swap that opens it is itself capped.
     function _enforceBuyCap(PoolId poolId, PoolState storage p, int128 tokensOut) private {
-        if (tokensOut <= 0 || block.timestamp >= p.windowEndsAt) return;
+        if (tokensOut <= 0) return;
+        if (p.windowEndsAt != 0 && block.timestamp >= p.windowEndsAt) return;
         uint256 cap = buyCap(poolId);
         address wallet = tx.origin;
         uint256 total = p.bought[wallet] + uint256(uint128(tokensOut));

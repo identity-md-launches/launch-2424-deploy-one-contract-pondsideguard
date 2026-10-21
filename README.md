@@ -20,9 +20,11 @@ window, jar and buyback, keyed by the pool's `PoolId`. Composed with The Hooks S
    ERC-6909 ETH claim and records it in `pendingFees()`. `claimFees()` redeems those claims to the recipient
    and anyone may call it. The fee is always 1% of the ETH that actually moved: a swap stopped early by its
    price limit or by thin liquidity pays on the filled part only (see *Fee arithmetic*).
-2. **Buy cap.** For 10 minutes from the pool's first swap (`windowEndsAt(poolId)`, zero until then), each
-   wallet may buy at most 1.0% of the token's total supply in total. A buy that would push a wallet past the
-   cap reverts with `BuyCapExceeded`. Sells are never capped.
+2. **Buy cap.** For 10 minutes from the pool's first swap that moves value (`windowEndsAt(poolId)`, zero
+   until then), each wallet may buy at most 1.0% of the token's total supply in total. The cap is in force
+   from the pool's registration, so the swap that opens the window is capped too, and a swap the pool cannot
+   fill (no liquidity yet) does not open it. A buy that would push a wallet past the cap reverts with
+   `BuyCapExceeded`. Sells are never capped.
 3. **Jar and buyback.** Another 1.0% of the ETH side of every swap goes into the pool's jar (`jar(poolId)`)
    held by the hook. Whenever the jar holds at least 0.1 ETH, `buyback(poolId)` — callable by anyone — spends
    the jar buying the pool's token from that pool and burns what it bought. The buy may not push the price
@@ -48,13 +50,16 @@ Enabled callbacks (and therefore the address bits the deployment must carry): `a
 | `claimFees()` | anyone | redeem `pendingFees()` claims to `feeRecipient` |
 | `buyback(bytes32 poolId)` | anyone | spend the pool's jar (≥ 0.1 ETH) on its token and burn it, within the band |
 | `jar(bytes32 poolId)` | view | ETH collected for the pool's buybacks (`jarClaims(poolId)` is the part held as claims) |
-| `windowEndsAt(bytes32 poolId)` | view | end of the pool's buy-cap window; 0 until its first swap |
+| `windowEndsAt(bytes32 poolId)` | view | end of the pool's buy-cap window; 0 until its first filled swap |
 | `pause()` / `unpause()` | owner | stop / resume swaps on every pool |
 | `paused()` | view | whether swaps are paused |
 | `isPool`, `poolKey`, `poolToken`, `windowOpen`, `buyCap`, `boughtDuringWindow`, `nextAutoBuybackAt`, `referencePrice`, `buybackSqrtPriceLimit`, `tokensBurned`, `tokensLocked`, `quoteSpecifiedEthFees` | view | per-pool / per-token details |
 
 `poolId` is `PoolKey.toId()` (`keccak256(abi.encode(key))`), the id the PoolManager's `Initialize` event
-carries.
+carries. Because one hook serves any number of pools, `windowEndsAt`, `jar` and `buyback` take that id; the
+hook has no `windowEndsAt()`, `jar()` or `buyback()` without an argument and no fallback, so a storefront
+must call the `bytes32` forms (selectors `windowEndsAt(bytes32)`, `jar(bytes32)`, `buyback(bytes32)`).
+`claimFees()`, `pause()`, `unpause()` and `paused()` take no argument.
 
 ## Deployment: why there are two contracts
 
@@ -148,9 +153,14 @@ reference is the pool's sqrt price at the hook's first interaction in the curren
   relayer share that submitter's origin, a contract wallet driven by several signers gets several caps, and
   anyone can split buys across EOAs. A v4 swap carries no authenticated end-user identity, so this is a
   per-wallet soft limit during ten minutes, not a security boundary.
-- **The window starts at the first swap**, not at initialization: initialization is permissionless and a pool
-  cannot trade before liquidity exists, so a clock started then could run out before trading opens. The first
-  swap itself is already capped.
+- **The window starts at the first swap that moves value**, not at initialization and not at a swap the pool
+  could not fill: initialization is permissionless, and a v4 pool without liquidity accepts swaps that move
+  nothing, so a clock started by either could be run out by a stranger before trading opens. The hook opens
+  the window in `afterSwap` only when the swap's delta is non-zero in either currency, and the cap applies
+  from registration, so the opening swap is itself capped. Residual: whoever can add a dust position (which
+  needs some of the token) and trade against it can open the window early. A creator who initializes, seeds
+  liquidity and checks the price in one transaction, or promptly, is not exposed; note also that any swap on
+  an empty pool slides its price to the swap's limit, which is the PoolManager's behaviour, not the hook's.
 - **Cap basis is the token's live `totalSupply()`.** Buybacks that burn tokens lower it slightly. A token with
   fewer than 100 units of supply (or zero supply at swap time) has a cap of 0 during its window.
 - **Burn.** The buyback offers the hook's whole balance of the token to `burn(uint256)`. Tokens the token
@@ -186,7 +196,8 @@ reference is the pool's sqrt price at the hook's first interaction in the curren
 - **Anyone**: call `deploy(salt)` once after launch, then `buyback(poolId)` whenever `jar(poolId) >= 0.1 ether`
   and the automatic attempt did not run or was bounded, and `claimFees()` whenever `pendingFees() > 0`.
 - **Pool creator**: initialize the pool with native ETH as `currency0` and a token that answers
-  `totalSupply()`, then seed liquidity. The buy-cap window opens with the first swap.
+  `totalSupply()`, then seed liquidity, preferably in the same transaction (an empty pool's price can be
+  moved by anyone's swap). The buy-cap window opens with the first swap that moves value.
 
 ## Repository layout
 
@@ -194,7 +205,7 @@ reference is the pool's sqrt price at the hook's first interaction in the curren
 src/PondsideGuard.sol           the hook
 src/PondsideGuardDeployer.sol   the contract the launch deploys
 script/MineSalt.s.sol           pure salt miner + script to print the salt for a live deployer
-test/                           Foundry tests (78) against a real PoolManager and v4 test routers
+test/                           Foundry tests (77) against a real PoolManager and v4 test routers
 lib/                            vendored dependencies (see lib/VENDORED.md): v4-core, solmate Owned, forge-std
 ```
 
@@ -210,7 +221,7 @@ Tests pass in any order, read no environment variables, and run with the verifie
 each swap mode's fee, partial fills of both ETH-specified swap modes (price limit and exhausted liquidity,
 plus a fuzz over price limits), error pass-through from the simulation, claim minting and redemption
 (recipient refusing ETH, PoolManager without ETH), the buy cap (at, above, cumulative, window boundary, lazy
-window start, other wallets, sells), several pools on one hook (independent state, a junk pool initialized
+window start, empty-pool swaps not opening the window, a sell opening it, other wallets, sells), several pools on one hook (independent state, a junk pool initialized
 first, same token in another fee tier), refused pools (non-ETH pair, token without `totalSupply`), automatic
 and manual buybacks, the failed-buyback-does-not-revert path and its retry delay, claim-settled buybacks,
 the price band (same-block sandwich, bounded next-block buyback with remainder, thinned liquidity, deep
