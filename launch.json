@@ -1,0 +1,14 @@
+{
+  "kind": "evm_contracts",
+  "contracts": [
+    {
+      "contract": "PondsideGuardDeployer",
+      "constructorArgs": [
+        "0x8366a39CC670B4001A1121B8F6A443A643e40951",
+        "$owner",
+        "$owner"
+      ]
+    }
+  ],
+  "notes": "The launch deploys PondsideGuardDeployer on Robinhood Chain with constructor arguments in order: PoolManager, owner, feeRecipient. Both wallet arguments resolve to the specified owner, 0x5Bff2a2FEcD1d6152676813b21346238733bEAB1. The deployer stores these immutable arguments without external constructor calls and passes them unchanged to PondsideGuard. Hook deployment is a separate, permissionless, one-time deploy(bytes32 salt) call after launch. The salt must be mined off chain against the deployed PondsideGuardDeployer address and its initCodeHash(), so that the predicted hook address satisfies (uint160(address) & 0x3fff) == 0x10cc. The accepted script/MineSalt.s.sol provides this search; predict(bytes32) and isValidSalt(bytes32) expose verification. An invalid salt reverts, and a successful deployment is recorded by hook() and PondsideGuardDeployed. The launch factory's salt is used only for the deployer, whose address has no hook permission constraint. PondsideGuard enables afterInitialize, beforeSwap, afterSwap, beforeSwapReturnDelta and afterSwapReturnDelta. Anyone may initialize the first native-ETH/token pool using the deployed hook on the configured PoolManager; that first pool permanently binds the hook. It takes 1% of the ETH side for the recipient and another 1% for the buyback jar, with ERC-6909 claims held by the hook when direct ETH payment fails. Anyone may call claimFees() to redeem pending recipient claims to the fixed recipient. During the first 10 minutes, cumulative buys per tx.origin are capped at 1% of the token's live total supply; windowEndsAt() exposes the end time. At a jar balance of at least 0.1 ETH, buyback() is permissionless while unpaused and the hook also attempts automatic buyback without reverting the triggering swap on failure. Buybacks offer the whole jar to the bound pool, retain any unspent amount, and call the token's burn(uint256); tokens that cannot be burned remain permanently locked in the hook. jar() exposes the accounted balance, including jar claims. The owner's only privileged actions are pause() and unpause(); paused() exposes the state and liquidity removal remains available while paused. This manifest deploys no token or pool and specifies no ETH funding or initialization calls."
+}
