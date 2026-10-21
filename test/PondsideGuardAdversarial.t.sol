@@ -290,6 +290,31 @@ contract PondsideGuardAdversarialTest is PondsideFixture {
         hook.simulateSwap(key, params);
     }
 
+    /// @dev The swap that opens the window is capped too: one wei over the cap on the opening swap reverts and
+    /// leaves the window unopened; exactly the cap opens it and uses the whole allowance.
+    function test_openingSwapIsCappedAtTheExactBoundary() public {
+        assertEq(hook.windowEndsAt(poolId), 0);
+        uint256 cap = hook.buyCap(poolId);
+        vm.expectRevert();
+        buyExactOut(alice, cap + 1, 50_000 ether);
+        assertEq(hook.windowEndsAt(poolId), 0, "a capped opening swap does not open the window");
+        assertEq(token.balanceOf(alice), 0);
+
+        // Time passing before the first filled swap does not shorten the window.
+        vm.warp(block.timestamp + 1 days);
+        buyExactOut(alice, cap, 50_000 ether);
+        assertEq(hook.windowEndsAt(poolId), block.timestamp + 10 minutes);
+        assertEq(hook.boughtDuringWindow(poolId, alice), cap);
+
+        // One second before the window closes the wallet is still capped; at the close it is free.
+        vm.warp(block.timestamp + 10 minutes - 1);
+        vm.expectRevert();
+        buyExactOut(alice, 1, 1 ether);
+        vm.warp(block.timestamp + 1);
+        buyExactOut(alice, 1 ether, 50_000 ether);
+        assertEq(token.balanceOf(alice), cap + 1 ether);
+    }
+
     // ------------------------------------------------------------------ hostile token / other pools
 
     function test_hostileTokenCannotReenterToSpendAnotherPoolsJarOrClaims() public {
