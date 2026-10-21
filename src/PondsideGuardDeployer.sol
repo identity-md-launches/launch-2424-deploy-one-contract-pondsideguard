@@ -19,6 +19,9 @@ contract PondsideGuardDeployer {
     address public immutable owner;
     /// @notice The wallet that receives the hook's 1% fee.
     address public immutable feeRecipient;
+    /// @notice keccak256 of the hook's creation code with this deployer's constructor arguments appended, fixed
+    /// at construction so that salt searches (`isValidSalt`, `predict`) do not rehash the creation code each call.
+    bytes32 public immutable initCodeHash;
     /// @notice The deployed hook, or zero until `deploy` has run.
     PondsideGuard public hook;
 
@@ -37,6 +40,9 @@ contract PondsideGuardDeployer {
         poolManager = poolManager_;
         owner = owner_;
         feeRecipient = feeRecipient_;
+        initCodeHash = keccak256(
+            abi.encodePacked(type(PondsideGuard).creationCode, abi.encode(poolManager_, owner_, feeRecipient_))
+        );
     }
 
     /// @notice The permission bits the hook address must carry (mask over the low 14 bits).
@@ -45,15 +51,9 @@ contract PondsideGuardDeployer {
             | Hooks.BEFORE_SWAP_RETURNS_DELTA_FLAG | Hooks.AFTER_SWAP_RETURNS_DELTA_FLAG;
     }
 
-    /// @notice keccak256 of the hook's creation code with this deployer's constructor arguments appended.
-    function initCodeHash() public view returns (bytes32) {
-        return
-            keccak256(abi.encodePacked(type(PondsideGuard).creationCode, abi.encode(poolManager, owner, feeRecipient)));
-    }
-
     /// @notice The address `deploy(salt)` creates.
     function predict(bytes32 salt) public view returns (address) {
-        return address(uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), address(this), salt, initCodeHash())))));
+        return address(uint160(uint256(keccak256(abi.encodePacked(bytes1(0xff), address(this), salt, initCodeHash)))));
     }
 
     /// @notice Whether `salt` yields an address with the required permission bits.

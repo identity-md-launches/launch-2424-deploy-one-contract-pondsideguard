@@ -6,6 +6,7 @@ import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
 import {IUnlockCallback} from "v4-core/interfaces/callback/IUnlockCallback.sol";
 import {Hooks} from "v4-core/libraries/Hooks.sol";
 import {SafeCast} from "v4-core/libraries/SafeCast.sol";
+import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
 import {TickMath} from "v4-core/libraries/TickMath.sol";
 import {TransientStateLibrary} from "v4-core/libraries/TransientStateLibrary.sol";
 import {BalanceDelta} from "v4-core/types/BalanceDelta.sol";
@@ -23,23 +24,29 @@ interface IPoolToken {
 }
 
 /// @title PondsideGuard
-/// @notice A standalone Uniswap v4 hook for one native-ETH / token pool. It owns no token and no pool: whoever
-/// initializes the first pool with this hook on the configured PoolManager binds it. From then on the hook
+/// @notice A standalone Uniswap v4 hook for native-ETH / token pools. It owns no token and no pool: anyone may
+/// initialize a new ETH / token pool with it on the configured PoolManager, and every such pool gets its own
+/// buy-cap window, jar and buyback. For each pool the hook
 ///   1. takes 1% of the ETH side of every swap as a fee for `feeRecipient`, paid inside the swap (or minted as an
 ///      ERC-6909 claim the hook holds for the recipient when the PoolManager cannot pay it directly);
-///   2. caps each wallet (`tx.origin`) at 1% of the token's total supply bought during the first 10 minutes;
-///   3. takes another 1% of the ETH side into a jar and, once the jar holds at least 0.1 ETH, buys the pool's
-///      token from the pool with the whole jar and burns it (automatically after the swap that filled the jar
-///      when that succeeds, otherwise through `buyback()` which anyone may call);
+///   2. caps each wallet (`tx.origin`) at 1% of the token's total supply bought during the first 10 minutes of
+///      trading (the window opens with the pool's first swap);
+///   3. takes another 1% of the ETH side into the pool's jar and, once the jar holds at least 0.1 ETH, buys the
+///      pool's token from the pool with the jar and burns it (automatically after the swap that filled the jar
+///      when that succeeds, otherwise through `buyback(poolId)` which anyone may call);
 ///   4. lets `owner` pause and unpause swaps. Liquidity is never hooked, so it can always be removed.
-/// @dev Liquidity and donate callbacks are not enabled. The hook's own buyback swap skips the hook callbacks,
-/// which is how the PoolManager treats a swap whose caller is the pool's hook.
+/// @dev When ETH is the swap's specified currency the fee is charged through the beforeSwap delta. To charge 1% of
+/// the ETH that really moves (not of the request) the hook first runs the swap itself and reverts it, reading the
+/// fill the PoolManager will produce, so a swap stopped early by its price limit or by thin liquidity pays only on
+/// the filled part. The hook's own swaps skip the hook callbacks, which is how the PoolManager treats a swap whose
+/// caller is the pool's hook. Liquidity and donate callbacks are not enabled.
 contract PondsideGuard is IHooks, IUnlockCallback {
     using Hooks for IHooks;
     using CurrencyLibrary for Currency;
     using PoolIdLibrary for PoolKey;
     using SafeCast for uint256;
     using SafeCast for int256;
+    using StateLibrary for IPoolManager;
     using TransientStateLibrary for IPoolManager;
 
     // ---------------------------------------------------------------------------------------------
@@ -52,12 +59,19 @@ contract PondsideGuard is IHooks, IUnlockCallback {
     uint256 public constant FEE_BPS = 100;
     /// @notice Jar share, in basis points of the ETH side of a swap (1.0%).
     uint256 public constant JAR_BPS = 100;
-    /// @notice Length of the per-wallet buy-cap window after the pool opens.
+    /// @notice Length of the per-wallet buy-cap window after the pool's first swap.
     uint256 public constant BUY_WINDOW = 10 minutes;
     /// @notice Per-wallet cap during the window, in basis points of the token's total supply (1.0%).
     uint256 public constant BUY_CAP_BPS = 100;
     /// @notice Jar balance at which a buyback may run.
     uint256 public constant BUYBACK_THRESHOLD = 0.1 ether;
+    /// @notice How far below the block's reference sqrt price a buyback may push the pool, in basis points of the
+    /// sqrt price (1% of the sqrt price is about 2% of the price). Whatever the band does not let it spend stays in
+    /// the jar for a later buyback.
+    uint256 public constant BUYBACK_SQRT_PRICE_BAND_BPS = 100;
+    /// @notice After an automatic buyback attempt fails, swaps on that pool do not retry it for this long.
+    /// `buyback(poolId)` is never delayed.
+    uint256 public constant AUTO_BUYBACK_RETRY_DELAY = 5 minutes;
 
     uint8 private constant ACTION_CLAIM_FEES = 1;
     uint8 private constant ACTION_BUYBACK = 2;
@@ -70,44 +84,59 @@ contract PondsideGuard is IHooks, IUnlockCallback {
     IPoolManager public immutable poolManager;
     /// @notice The only privileged account. It may pause and unpause swaps and nothing else.
     address public immutable owner;
-    /// @notice Receives the 1% hook fee.
+    /// @notice Receives the 1% hook fee from every pool.
     address public immutable feeRecipient;
 
     // ---------------------------------------------------------------------------------------------
     // State
     // ---------------------------------------------------------------------------------------------
 
-    /// @notice The pool bound to this hook (set by the first, and only, pool initialization).
-    PoolKey public poolKey;
-    /// @notice Whether a pool has been bound.
-    bool public bound;
-    /// @notice Timestamp at which the per-wallet buy-cap window closes (pool open time + 10 minutes).
-    uint256 public windowEndsAt;
-    /// @notice ETH collected for buybacks, in wei. Held as ETH in this contract plus `jarClaims`.
-    uint256 public jar;
-    /// @notice Part of `jar` held as ERC-6909 ETH claims on the PoolManager instead of ETH.
-    uint256 public jarClaims;
+    struct PoolState {
+        /// @dev The pool's token (currency1; currency0 is always native ETH).
+        Currency token;
+        uint24 fee;
+        int24 tickSpacing;
+        bool initialized;
+        /// @dev Timestamp at which the buy-cap window closes; zero until the pool's first swap.
+        uint64 windowEndsAt;
+        /// @dev Automatic buyback attempts are skipped before this timestamp.
+        uint64 nextAutoBuybackAt;
+        /// @dev Timestamp of the block whose opening price `referenceSqrtPriceX96` holds.
+        uint64 referenceAt;
+        /// @dev The pool's sqrt price at the hook's first interaction in the block `referenceAt`.
+        uint160 referenceSqrtPriceX96;
+        /// @dev ETH collected for buybacks, in wei. Held as ETH in this contract plus `jarClaims`.
+        uint256 jar;
+        /// @dev Part of `jar` held as ERC-6909 ETH claims on the PoolManager instead of ETH.
+        uint256 jarClaims;
+        /// @dev Tokens each wallet bought during the window.
+        mapping(address wallet => uint256 amount) bought;
+    }
+
+    mapping(PoolId poolId => PoolState) private _pools;
+
     /// @notice Hook fees the PoolManager could not pay directly, held as ERC-6909 ETH claims for `feeRecipient`.
     uint256 public pendingFees;
-    /// @notice Whether swaps are paused.
+    /// @notice Whether swaps are paused (for every pool using this hook).
     bool public paused;
-    /// @notice Tokens each wallet bought during the window.
-    mapping(address wallet => uint256 amount) public boughtDuringWindow;
-    /// @notice Tokens bought back and destroyed through the token's `burn`.
-    uint256 public totalBurned;
-    /// @notice Tokens bought back and locked in this contract forever because the token has no `burn`.
-    uint256 public totalLocked;
+    /// @notice Tokens bought back and destroyed through the token's `burn`, per token.
+    mapping(address token => uint256 amount) public tokensBurned;
+    /// @notice Tokens bought back that the token refused to burn, held in this contract, per token. They are
+    /// offered to `burn` again at that token's next buyback.
+    mapping(address token => uint256 amount) public tokensLocked;
 
     // ---------------------------------------------------------------------------------------------
     // Events and errors
     // ---------------------------------------------------------------------------------------------
 
-    event PoolBound(PoolId indexed poolId, Currency token, uint256 windowEndsAt);
-    event FeePaid(address indexed recipient, uint256 amount);
-    event FeeClaimMinted(uint256 amount);
+    event PoolRegistered(PoolId indexed poolId, Currency token, uint24 fee, int24 tickSpacing);
+    event WindowOpened(PoolId indexed poolId, uint256 windowEndsAt);
+    event FeePaid(PoolId indexed poolId, address indexed recipient, uint256 amount);
+    event FeeClaimMinted(PoolId indexed poolId, uint256 amount);
     event FeesClaimed(address indexed recipient, uint256 amount);
-    event JarFunded(uint256 amount, bool asClaim);
-    event Buyback(uint256 ethSpent, uint256 tokensBought, bool burned);
+    event JarFunded(PoolId indexed poolId, uint256 amount, bool asClaim);
+    event Buyback(PoolId indexed poolId, uint256 ethSpent, uint256 tokensBought, bool burned);
+    event AutoBuybackDeferred(PoolId indexed poolId, uint256 until);
     event Paused(address indexed by);
     event Unpaused(address indexed by);
 
@@ -116,18 +145,23 @@ contract PondsideGuard is IHooks, IUnlockCallback {
     error NotOwner();
     error NotSelf();
     error HookNotImplemented();
-    error AlreadyBound();
     error PairMustBeNativeEth();
+    error TokenSupplyUnavailable();
+    error UnknownPool();
     error SwapsPaused();
     error AlreadyPaused();
     error NotPaused();
     error BuyCapExceeded(address wallet, uint256 attemptedTotal, uint256 cap);
     error JarBelowThreshold(uint256 jar, uint256 threshold);
     error BuybackBoughtNothing();
+    error BuybackPriceOutOfBand(uint160 currentSqrtPriceX96, uint160 limitSqrtPriceX96);
     error CurrencySynced();
     error NothingToClaim();
     error UnknownAction(uint8 action);
     error DirectEthNotAccepted();
+    /// @dev Carries a simulated swap's delta out of the reverting simulation call.
+    error SimulationResult(int256 delta);
+    error SimulationDidNotRevert();
 
     // ---------------------------------------------------------------------------------------------
     // Construction
@@ -154,6 +188,11 @@ contract PondsideGuard is IHooks, IUnlockCallback {
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
+        _;
+    }
+
+    modifier onlySelf() {
+        if (msg.sender != address(this)) revert NotSelf();
         _;
     }
 
@@ -196,7 +235,7 @@ contract PondsideGuard is IHooks, IUnlockCallback {
     // Owner: pause / unpause
     // ---------------------------------------------------------------------------------------------
 
-    /// @notice Pause swaps. Liquidity can still be added and removed.
+    /// @notice Pause swaps on every pool using this hook. Liquidity can still be added and removed.
     function pause() external onlyOwner {
         if (paused) revert AlreadyPaused();
         paused = true;
@@ -218,28 +257,37 @@ contract PondsideGuard is IHooks, IUnlockCallback {
     /// `feeRecipient`. Anyone may call.
     function claimFees() external {
         if (pendingFees == 0) revert NothingToClaim();
-        poolManager.unlock(abi.encode(ACTION_CLAIM_FEES));
+        poolManager.unlock(abi.encode(ACTION_CLAIM_FEES, PoolId.wrap(0)));
     }
 
-    /// @notice Spend the whole jar buying the pool's token from the bound pool and burn what was bought.
-    /// Anyone may call once the jar holds at least `BUYBACK_THRESHOLD`.
-    function buyback() external {
+    /// @notice Spend the pool's jar buying its token from the pool and burn what was bought. Anyone may call
+    /// once the jar holds at least `BUYBACK_THRESHOLD`. The buy stops at the block's price band (see
+    /// `BUYBACK_SQRT_PRICE_BAND_BPS`); anything it could not spend stays in the jar.
+    /// @param poolId The pool whose jar to spend (`PoolKey.toId()`).
+    function buyback(PoolId poolId) external {
         if (paused) revert SwapsPaused();
-        if (jar < BUYBACK_THRESHOLD) revert JarBelowThreshold(jar, BUYBACK_THRESHOLD);
-        poolManager.unlock(abi.encode(ACTION_BUYBACK));
+        PoolState storage p = _pool(poolId);
+        if (p.jar < BUYBACK_THRESHOLD) revert JarBelowThreshold(p.jar, BUYBACK_THRESHOLD);
+        poolManager.unlock(abi.encode(ACTION_BUYBACK, poolId));
     }
 
     /// @notice Internal entry point for the automatic buyback attempted inside the swap that fills the jar.
     /// Only this contract may call it; it exists so that a failing buyback can be caught without reverting
     /// the swap that triggered it.
-    function selfBuyback() external {
-        if (msg.sender != address(this)) revert NotSelf();
-        _executeBuyback();
+    function selfBuyback(PoolId poolId) external onlySelf {
+        _executeBuyback(poolId);
+    }
+
+    /// @notice Internal entry point for the fee simulation: runs the swap the PoolManager is about to run and
+    /// reverts with its delta, so the pool is left untouched. Only this contract may call it.
+    function simulateSwap(PoolKey calldata key, SwapParams calldata params) external onlySelf {
+        BalanceDelta delta = poolManager.swap(key, params, "");
+        revert SimulationResult(BalanceDelta.unwrap(delta));
     }
 
     /// @inheritdoc IUnlockCallback
     function unlockCallback(bytes calldata data) external onlyPoolManager returns (bytes memory) {
-        uint8 action = abi.decode(data, (uint8));
+        (uint8 action, PoolId poolId) = abi.decode(data, (uint8, PoolId));
         if (action == ACTION_CLAIM_FEES) {
             uint256 amount = pendingFees;
             pendingFees = 0;
@@ -247,7 +295,7 @@ contract PondsideGuard is IHooks, IUnlockCallback {
             poolManager.take(CurrencyLibrary.ADDRESS_ZERO, feeRecipient, amount);
             emit FeesClaimed(feeRecipient, amount);
         } else if (action == ACTION_BUYBACK) {
-            _executeBuyback();
+            _executeBuyback(poolId);
         } else {
             revert UnknownAction(action);
         }
@@ -259,65 +307,88 @@ contract PondsideGuard is IHooks, IUnlockCallback {
     // ---------------------------------------------------------------------------------------------
 
     /// @inheritdoc IHooks
+    /// @dev Registers the pool. Any number of ETH / token pools may use the hook; each has its own state.
     function afterInitialize(address, PoolKey calldata key, uint160, int24) external onlyPoolManager returns (bytes4) {
-        if (bound) revert AlreadyBound();
         if (!key.currency0.isAddressZero()) revert PairMustBeNativeEth();
-        bound = true;
-        poolKey = key;
-        windowEndsAt = block.timestamp + BUY_WINDOW;
-        emit PoolBound(key.toId(), key.currency1, windowEndsAt);
+        _requireSupplyReadable(key.currency1);
+        PoolId poolId = key.toId();
+        PoolState storage p = _pools[poolId];
+        p.token = key.currency1;
+        p.fee = key.fee;
+        p.tickSpacing = key.tickSpacing;
+        p.initialized = true;
+        emit PoolRegistered(poolId, key.currency1, key.fee, key.tickSpacing);
         return IHooks.afterInitialize.selector;
     }
 
     /// @inheritdoc IHooks
-    /// @dev When ETH is the specified currency (exact-input buy, exact-output sell) the fee is charged here by
-    /// returning a positive specified delta; the PoolManager credits it to the hook after the swap.
-    function beforeSwap(address, PoolKey calldata, SwapParams calldata params, bytes calldata)
+    /// @dev Opens the buy-cap window on the pool's first swap and records the block's reference price. When ETH
+    /// is the specified currency (exact-input buy, exact-output sell) the fee is charged here as a positive
+    /// specified delta computed from the ETH the pool will actually move, found by simulating the swap.
+    function beforeSwap(address, PoolKey calldata key, SwapParams calldata params, bytes calldata)
         external
-        view
         onlyPoolManager
         returns (bytes4, BeforeSwapDelta, uint24)
     {
         if (paused) revert SwapsPaused();
+        PoolId poolId = key.toId();
+        PoolState storage p = _pool(poolId);
+        _touchReference(poolId, p);
+        if (p.windowEndsAt == 0) {
+            p.windowEndsAt = uint64(block.timestamp + BUY_WINDOW);
+            emit WindowOpened(poolId, p.windowEndsAt);
+        }
+
         int128 specified;
         if (_ethIsSpecified(params)) {
             (uint256 fee, uint256 jarCut) = _feesForSpecifiedEth(params.amountSpecified);
-            specified = (fee + jarCut).toInt128();
+            if (fee + jarCut > 0) {
+                uint256 realised = _simulateEthSide(key, params, fee + jarCut);
+                (fee, jarCut) = _specifiedEthFees(params.amountSpecified, realised);
+                specified = (fee + jarCut).toInt128();
+            }
         }
         return (IHooks.beforeSwap.selector, toBeforeSwapDelta(specified, 0), 0);
     }
 
     /// @inheritdoc IHooks
     /// @dev Settles both fee shares, enforces the buy cap and attempts the automatic buyback.
-    function afterSwap(address, PoolKey calldata, SwapParams calldata params, BalanceDelta delta, bytes calldata)
+    function afterSwap(address, PoolKey calldata key, SwapParams calldata params, BalanceDelta delta, bytes calldata)
         external
         onlyPoolManager
         returns (bytes4, int128)
     {
+        PoolId poolId = key.toId();
+        PoolState storage p = _pool(poolId);
+        int128 eth = delta.amount0();
+        uint256 ethSide = eth < 0 ? uint256(uint128(-eth)) : uint256(uint128(eth));
+
         uint256 fee;
         uint256 jarCut;
         int128 unspecified;
         if (_ethIsSpecified(params)) {
-            (fee, jarCut) = _feesForSpecifiedEth(params.amountSpecified);
+            // Already charged in beforeSwap on the same realised ETH side; recompute the split to settle it.
+            (fee, jarCut) = _specifiedEthFees(params.amountSpecified, ethSide);
+        } else if (params.amountSpecified < 0) {
+            // Exact-input sell: the pool pays `ethSide` out, the trader receives it less the fees.
+            (fee, jarCut) = _feesFromGross(ethSide);
+            unspecified = (fee + jarCut).toInt128();
         } else {
-            int128 eth = delta.amount0();
-            uint256 ethSide = eth < 0 ? uint256(uint128(-eth)) : uint256(uint128(eth));
-            if (params.amountSpecified < 0) {
-                // Exact-input sell: the pool pays `ethSide` out, the trader receives it less the fees.
-                (fee, jarCut) = _feesFromGross(ethSide);
-            } else {
-                // Exact-output buy: the pool needs `ethSide`, the trader pays it plus the fees.
-                (fee, jarCut) = _feesFromNet(ethSide);
-            }
+            // Exact-output buy: the pool needs `ethSide`, the trader pays it plus the fees.
+            (fee, jarCut) = _feesFromNet(ethSide);
             unspecified = (fee + jarCut).toInt128();
         }
 
-        if (params.zeroForOne) _enforceBuyCap(delta.amount1());
-        _collect(fee, jarCut);
+        if (params.zeroForOne) _enforceBuyCap(poolId, p, delta.amount1());
+        _collect(poolId, p, fee, jarCut);
 
-        if (jar >= BUYBACK_THRESHOLD) {
+        if (p.jar >= BUYBACK_THRESHOLD && block.timestamp >= p.nextAutoBuybackAt) {
             // The swap that fills the jar must not revert if the buyback fails.
-            try this.selfBuyback() {} catch {}
+            try this.selfBuyback(poolId) {}
+            catch {
+                p.nextAutoBuybackAt = uint64(block.timestamp + AUTO_BUYBACK_RETRY_DELAY);
+                emit AutoBuybackDeferred(poolId, p.nextAutoBuybackAt);
+            }
         }
         return (IHooks.afterSwap.selector, unspecified);
     }
@@ -383,23 +454,77 @@ contract PondsideGuard is IHooks, IUnlockCallback {
     // Views
     // ---------------------------------------------------------------------------------------------
 
-    /// @notice The pool's token (currency1 of the bound pool), or zero before a pool is bound.
-    function poolToken() public view returns (address) {
-        return Currency.unwrap(poolKey.currency1);
+    /// @notice Whether `poolId` is a pool initialized with this hook.
+    function isPool(PoolId poolId) public view returns (bool) {
+        return _pools[poolId].initialized;
+    }
+
+    /// @notice The full key of a registered pool (currency0 is native ETH, hooks is this contract).
+    function poolKey(PoolId poolId) external view returns (PoolKey memory) {
+        return _key(_pool(poolId));
+    }
+
+    /// @notice The pool's token (currency1), or zero for an unknown pool.
+    function poolToken(PoolId poolId) public view returns (address) {
+        return Currency.unwrap(_pools[poolId].token);
+    }
+
+    /// @notice Timestamp at which the pool's per-wallet buy-cap window closes (first swap + 10 minutes), or zero
+    /// while the pool has not traded yet.
+    function windowEndsAt(PoolId poolId) external view returns (uint256) {
+        return _pools[poolId].windowEndsAt;
+    }
+
+    /// @notice Whether the per-wallet buy cap is in force on the pool: from registration until 10 minutes after
+    /// its first swap.
+    function windowOpen(PoolId poolId) external view returns (bool) {
+        PoolState storage p = _pools[poolId];
+        return p.initialized && (p.windowEndsAt == 0 || block.timestamp < p.windowEndsAt);
     }
 
     /// @notice The maximum a wallet may buy during the window, in tokens, from the token's live total supply.
-    function buyCap() public view returns (uint256) {
-        if (!bound) return 0;
-        return IPoolToken(poolToken()).totalSupply() * BUY_CAP_BPS / BPS;
+    function buyCap(PoolId poolId) public view returns (uint256) {
+        PoolState storage p = _pools[poolId];
+        if (!p.initialized) return 0;
+        return IPoolToken(Currency.unwrap(p.token)).totalSupply() * BUY_CAP_BPS / BPS;
     }
 
-    /// @notice Whether the per-wallet buy cap is in force.
-    function windowOpen() public view returns (bool) {
-        return bound && block.timestamp < windowEndsAt;
+    /// @notice Tokens `wallet` bought from the pool during its window.
+    function boughtDuringWindow(PoolId poolId, address wallet) external view returns (uint256) {
+        return _pools[poolId].bought[wallet];
     }
 
-    /// @notice Fee preview for a swap in which ETH is the specified amount.
+    /// @notice ETH collected for the pool's buybacks, in wei (ETH held here plus `jarClaims`).
+    function jar(PoolId poolId) external view returns (uint256) {
+        return _pools[poolId].jar;
+    }
+
+    /// @notice Part of the pool's jar held as ERC-6909 ETH claims on the PoolManager.
+    function jarClaims(PoolId poolId) external view returns (uint256) {
+        return _pools[poolId].jarClaims;
+    }
+
+    /// @notice Timestamp before which swaps on the pool skip the automatic buyback attempt.
+    function nextAutoBuybackAt(PoolId poolId) external view returns (uint256) {
+        return _pools[poolId].nextAutoBuybackAt;
+    }
+
+    /// @notice The reference sqrt price a buyback in the current block is bounded by, and when it was recorded.
+    /// A zero `recordedAt` or one older than the current block means the next interaction records a fresh one.
+    function referencePrice(PoolId poolId) external view returns (uint160 sqrtPriceX96, uint256 recordedAt) {
+        PoolState storage p = _pools[poolId];
+        return (p.referenceSqrtPriceX96, p.referenceAt);
+    }
+
+    /// @notice The sqrt price limit a buyback would use right now.
+    function buybackSqrtPriceLimit(PoolId poolId) external view returns (uint160) {
+        PoolState storage p = _pool(poolId);
+        uint160 anchor = p.referenceSqrtPriceX96;
+        if (p.referenceAt != block.timestamp) (anchor,,,) = poolManager.getSlot0(poolId);
+        return _buybackLimit(anchor);
+    }
+
+    /// @notice Fee preview for a fully filled swap in which ETH is the specified amount.
     /// @param amountSpecified Negative for an exact-input buy (ETH in), positive for an exact-output sell (ETH out).
     function quoteSpecifiedEthFees(int256 amountSpecified) external pure returns (uint256 fee, uint256 jarCut) {
         return _feesForSpecifiedEth(amountSpecified);
@@ -409,9 +534,99 @@ contract PondsideGuard is IHooks, IUnlockCallback {
     // Internals
     // ---------------------------------------------------------------------------------------------
 
+    function _pool(PoolId poolId) private view returns (PoolState storage p) {
+        p = _pools[poolId];
+        if (!p.initialized) revert UnknownPool();
+    }
+
+    function _key(PoolState storage p) private view returns (PoolKey memory) {
+        return PoolKey({
+            currency0: CurrencyLibrary.ADDRESS_ZERO,
+            currency1: p.token,
+            fee: p.fee,
+            tickSpacing: p.tickSpacing,
+            hooks: IHooks(address(this))
+        });
+    }
+
+    /// @dev The buy cap reads the token's `totalSupply()` on every buy during the window; refuse a pool whose
+    /// token cannot answer it, so that its buys do not revert for ten minutes.
+    function _requireSupplyReadable(Currency token) private view {
+        (bool ok, bytes memory ret) =
+            Currency.unwrap(token).staticcall(abi.encodeWithSelector(IPoolToken.totalSupply.selector));
+        if (!ok || ret.length < 32) revert TokenSupplyUnavailable();
+    }
+
+    /// @dev Record the pool's price at the hook's first interaction in this block. Buybacks in the block may not
+    /// push the price more than the band below it, so a trade in the same block cannot move the price first and
+    /// have the jar buy at the moved price.
+    function _touchReference(PoolId poolId, PoolState storage p) private {
+        if (p.referenceAt == block.timestamp) return;
+        (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(poolId);
+        p.referenceSqrtPriceX96 = sqrtPriceX96;
+        p.referenceAt = uint64(block.timestamp);
+    }
+
+    function _buybackLimit(uint160 referenceSqrtPriceX96) private pure returns (uint160) {
+        uint256 limit = uint256(referenceSqrtPriceX96) * (BPS - BUYBACK_SQRT_PRICE_BAND_BPS) / BPS;
+        if (limit <= TickMath.MIN_SQRT_PRICE) return TickMath.MIN_SQRT_PRICE + 1;
+        return uint160(limit);
+    }
+
     /// @dev ETH is currency0. It is the specified currency for exact-input buys and exact-output sells.
     function _ethIsSpecified(SwapParams calldata params) private pure returns (bool) {
         return params.zeroForOne == (params.amountSpecified < 0);
+    }
+
+    /// @dev Run the swap the PoolManager is about to run (the request adjusted by the full-fill fee, exactly as
+    /// the PoolManager adjusts it) and revert it, returning the ETH it moved. A fill stopped early by the
+    /// swapper's price limit or by liquidity moves the same ETH whatever the request, so the fee computed from it
+    /// matches the real swap.
+    function _simulateEthSide(PoolKey calldata key, SwapParams calldata params, uint256 fullFees)
+        private
+        returns (uint256)
+    {
+        SwapParams memory sim = SwapParams({
+            zeroForOne: params.zeroForOne,
+            amountSpecified: params.amountSpecified + int256(fullFees),
+            sqrtPriceLimitX96: params.sqrtPriceLimitX96
+        });
+        try this.simulateSwap(key, sim) {
+            revert SimulationDidNotRevert();
+        } catch (bytes memory reason) {
+            if (reason.length == 36 && bytes4(reason) == SimulationResult.selector) {
+                int256 raw;
+                assembly ("memory-safe") {
+                    raw := mload(add(reason, 36))
+                }
+                int128 eth = BalanceDelta.wrap(raw).amount0();
+                return eth < 0 ? uint256(uint128(-eth)) : uint256(uint128(eth));
+            }
+            // Anything else (price limit already exceeded, no liquidity, ...) is the swap's own error.
+            assembly ("memory-safe") {
+                revert(add(reason, 32), mload(reason))
+            }
+        }
+    }
+
+    /// @dev Fees for a swap in which ETH is specified, from the ETH side the pool really moves. A full fill pays
+    /// the quote on the request; a partial fill pays 1% + 1% of the gross ETH side of what was filled.
+    function _specifiedEthFees(int256 amountSpecified, uint256 realised)
+        private
+        pure
+        returns (uint256 fee, uint256 jarCut)
+    {
+        (fee, jarCut) = _feesForSpecifiedEth(amountSpecified);
+        uint256 full = fee + jarCut;
+        if (amountSpecified < 0) {
+            // Exact-input buy: the pool receives the request less the fees when fully filled.
+            if (realised >= uint256(-amountSpecified) - full) return (fee, jarCut);
+            (uint256 partialFee, uint256 partialJar) = _feesFromNet(realised);
+            return (partialFee < fee ? partialFee : fee, partialJar < jarCut ? partialJar : jarCut);
+        }
+        // Exact-output sell: the pool pays the request plus the fees when fully filled.
+        if (realised >= uint256(amountSpecified) + full) return (fee, jarCut);
+        return _feesFromGross(realised);
     }
 
     function _feesForSpecifiedEth(int256 amountSpecified) private pure returns (uint256 fee, uint256 jarCut) {
@@ -435,79 +650,85 @@ contract PondsideGuard is IHooks, IUnlockCallback {
         return _feesFromGross(gross);
     }
 
-    function _enforceBuyCap(int128 tokensOut) private {
-        if (tokensOut <= 0 || block.timestamp >= windowEndsAt) return;
-        uint256 cap = buyCap();
+    function _enforceBuyCap(PoolId poolId, PoolState storage p, int128 tokensOut) private {
+        if (tokensOut <= 0 || block.timestamp >= p.windowEndsAt) return;
+        uint256 cap = buyCap(poolId);
         address wallet = tx.origin;
-        uint256 total = boughtDuringWindow[wallet] + uint256(uint128(tokensOut));
+        uint256 total = p.bought[wallet] + uint256(uint128(tokensOut));
         if (total > cap) revert BuyCapExceeded(wallet, total, cap);
-        boughtDuringWindow[wallet] = total;
+        p.bought[wallet] = total;
     }
 
     /// @dev Settle the fee to the recipient and the jar cut to this contract, in ETH when the PoolManager can pay,
     /// otherwise as ERC-6909 claims held here. The PoolManager credits the hook's delta after the callback returns.
-    function _collect(uint256 fee, uint256 jarCut) private {
+    function _collect(PoolId poolId, PoolState storage p, uint256 fee, uint256 jarCut) private {
         if (fee > 0) {
             try poolManager.take(CurrencyLibrary.ADDRESS_ZERO, feeRecipient, fee) {
-                emit FeePaid(feeRecipient, fee);
+                emit FeePaid(poolId, feeRecipient, fee);
             } catch {
                 poolManager.mint(address(this), CurrencyLibrary.ADDRESS_ZERO.toId(), fee);
                 pendingFees += fee;
-                emit FeeClaimMinted(fee);
+                emit FeeClaimMinted(poolId, fee);
             }
         }
         if (jarCut > 0) {
             try poolManager.take(CurrencyLibrary.ADDRESS_ZERO, address(this), jarCut) {
-                emit JarFunded(jarCut, false);
+                emit JarFunded(poolId, jarCut, false);
             } catch {
                 poolManager.mint(address(this), CurrencyLibrary.ADDRESS_ZERO.toId(), jarCut);
-                jarClaims += jarCut;
-                emit JarFunded(jarCut, true);
+                p.jarClaims += jarCut;
+                emit JarFunded(poolId, jarCut, true);
             }
-            jar += jarCut;
+            p.jar += jarCut;
         }
     }
 
-    /// @dev Runs inside an unlock. Spends the jar on an exact-input buy, pays with claims first and ETH second,
-    /// takes the tokens and burns them (or locks them here when the token cannot burn).
-    function _executeBuyback() private {
-        uint256 amount = jar;
+    /// @dev Runs inside an unlock. Spends the jar on an exact-input buy bounded by the block's price band, pays
+    /// with claims first and ETH second, takes the tokens and burns them (or keeps them here when the token
+    /// cannot burn). Whatever the band left unspent stays in the jar.
+    function _executeBuyback(PoolId poolId) private {
+        PoolState storage p = _pool(poolId);
+        uint256 amount = p.jar;
         if (amount < BUYBACK_THRESHOLD) revert JarBelowThreshold(amount, BUYBACK_THRESHOLD);
         // A synced ERC-20 would make a native settle revert and resetting it would break the outer caller.
         if (!poolManager.getSyncedCurrency().isAddressZero()) revert CurrencySynced();
 
+        _touchReference(poolId, p);
+        uint160 limit = _buybackLimit(p.referenceSqrtPriceX96);
+        (uint160 current,,,) = poolManager.getSlot0(poolId);
+        if (limit >= current) revert BuybackPriceOutOfBand(current, limit);
+
         BalanceDelta delta = poolManager.swap(
-            poolKey,
-            SwapParams({
-                zeroForOne: true, amountSpecified: -amount.toInt256(), sqrtPriceLimitX96: TickMath.MIN_SQRT_PRICE + 1
-            }),
-            ""
+            _key(p), SwapParams({zeroForOne: true, amountSpecified: -amount.toInt256(), sqrtPriceLimitX96: limit}), ""
         );
         uint256 spent = uint256(uint128(-delta.amount0()));
         uint256 bought = uint256(uint128(delta.amount1()));
         if (bought == 0) revert BuybackBoughtNothing();
-        jar = amount - spent;
+        p.jar = amount - spent;
 
-        uint256 fromClaims = jarClaims < spent ? jarClaims : spent;
+        uint256 fromClaims = p.jarClaims < spent ? p.jarClaims : spent;
         if (fromClaims > 0) {
-            jarClaims -= fromClaims;
+            p.jarClaims -= fromClaims;
             poolManager.burn(address(this), CurrencyLibrary.ADDRESS_ZERO.toId(), fromClaims);
         }
         uint256 fromBalance = spent - fromClaims;
         if (fromBalance > 0) poolManager.settle{value: fromBalance}();
 
-        poolManager.take(poolKey.currency1, address(this), bought);
-        bool burned = _burn(bought);
-        emit Buyback(spent, bought, burned);
+        poolManager.take(p.token, address(this), bought);
+        bool burned = _burn(p.token, bought);
+        emit Buyback(poolId, spent, bought, burned);
     }
 
-    /// @dev Burn through the token's `burn(uint256)`; tokens the token refuses to burn stay locked here forever.
-    function _burn(uint256 amount) private returns (bool burned) {
-        IPoolToken token = IPoolToken(poolToken());
-        uint256 before = token.balanceOf(address(this));
-        try token.burn(amount) {} catch {}
-        burned = token.balanceOf(address(this)) + amount == before;
-        if (burned) totalBurned += amount;
-        else totalLocked += amount;
+    /// @dev Offer the whole balance of the token held here (this purchase plus anything an earlier burn refused)
+    /// to the token's `burn(uint256)`. What it does not destroy stays here until the next buyback tries again.
+    function _burn(Currency currency, uint256 bought) private returns (bool burned) {
+        IPoolToken token = IPoolToken(Currency.unwrap(currency));
+        uint256 held = token.balanceOf(address(this));
+        try token.burn(held) {} catch {}
+        uint256 left = token.balanceOf(address(this));
+        uint256 destroyed = left < held ? held - left : 0;
+        if (destroyed > 0) tokensBurned[Currency.unwrap(currency)] += destroyed;
+        tokensLocked[Currency.unwrap(currency)] = left;
+        burned = destroyed >= bought;
     }
 }

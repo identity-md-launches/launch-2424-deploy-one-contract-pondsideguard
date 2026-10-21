@@ -8,6 +8,7 @@ import {IHooks} from "v4-core/interfaces/IHooks.sol";
 import {TickMath} from "v4-core/libraries/TickMath.sol";
 import {Currency, CurrencyLibrary} from "v4-core/types/Currency.sol";
 import {PoolKey} from "v4-core/types/PoolKey.sol";
+import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
 import {BalanceDelta} from "v4-core/types/BalanceDelta.sol";
 import {ModifyLiquidityParams, SwapParams} from "v4-core/types/PoolOperation.sol";
 import {PoolSwapTest} from "v4-core/test/PoolSwapTest.sol";
@@ -17,6 +18,7 @@ import {PondsideGuardDeployer} from "../../src/PondsideGuardDeployer.sol";
 import {SaltMiner} from "../../script/MineSalt.s.sol";
 import {Hooks} from "v4-core/libraries/Hooks.sol";
 import {CustomRevert} from "v4-core/libraries/CustomRevert.sol";
+import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
 
 /// @notice Minimal ERC-20 with `burn`, standing in for the pool's token.
 contract BurnableToken {
@@ -28,6 +30,8 @@ contract BurnableToken {
     mapping(address => mapping(address => uint256)) public allowance;
     /// @dev When set, transfers to this address revert (lets tests make a buyback fail on purpose).
     address public blockedRecipient;
+    /// @dev When set, `burn` reverts (lets tests make a burn fail temporarily).
+    bool public burnDisabled;
 
     function mint(address to, uint256 amount) external {
         totalSupply += amount;
@@ -36,6 +40,10 @@ contract BurnableToken {
 
     function setBlockedRecipient(address who) external {
         blockedRecipient = who;
+    }
+
+    function setBurnDisabled(bool value) external {
+        burnDisabled = value;
     }
 
     function approve(address spender, uint256 amount) external returns (bool) {
@@ -56,6 +64,7 @@ contract BurnableToken {
     }
 
     function burn(uint256 amount) external {
+        require(!burnDisabled, "burn disabled");
         balanceOf[msg.sender] -= amount;
         totalSupply -= amount;
     }
@@ -98,6 +107,30 @@ contract PlainToken {
     }
 }
 
+/// @notice ERC-20 shape without `totalSupply`, which the hook must refuse at pool initialization.
+contract NoSupplyToken {
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        return true;
+    }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        allowance[from][msg.sender] -= amount;
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+}
+
 /// @notice Fee recipient that can refuse ETH, to exercise the claim fallback.
 contract TogglingRecipient {
     bool public accepting = true;
@@ -113,6 +146,8 @@ contract TogglingRecipient {
 
 /// @notice Shared deployment of PoolManager, routers, token, deployer and hook.
 abstract contract PondsideFixture is Test {
+    using PoolIdLibrary for PoolKey;
+
     uint160 internal constant SQRT_PRICE_1_1 = 79228162514264337593543950336;
     uint256 internal constant TOKEN_SUPPLY = 1_000_000 ether;
     uint128 internal constant POOL_LIQUIDITY = 500_000 ether;
@@ -132,6 +167,7 @@ abstract contract PondsideFixture is Test {
     PondsideGuardDeployer internal deployer;
     PondsideGuard internal hook;
     PoolKey internal key;
+    PoolId internal poolId;
 
     function setUp() public virtual {
         manager = new PoolManager(address(this));
@@ -142,6 +178,7 @@ abstract contract PondsideFixture is Test {
 
         (deployer, hook) = deployHook(recipient);
         key = poolKeyFor(address(token), hook);
+        poolId = key.toId();
         manager.initialize(key, SQRT_PRICE_1_1);
         addFullRangeLiquidity(lp, POOL_LIQUIDITY);
 
@@ -186,6 +223,36 @@ abstract contract PondsideFixture is Test {
             ""
         );
         vm.stopPrank();
+    }
+
+    /// @dev Exact-input buy with an explicit price limit (partial fills).
+    function buyExactInLimited(address trader, uint256 ethIn, uint160 limit) internal returns (BalanceDelta) {
+        vm.startPrank(trader, trader);
+        BalanceDelta delta = swapRouter.swap{value: ethIn}(
+            key,
+            SwapParams({zeroForOne: true, amountSpecified: -int256(ethIn), sqrtPriceLimitX96: limit}),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+        vm.stopPrank();
+        return delta;
+    }
+
+    /// @dev Exact-output sell with an explicit price limit (partial fills).
+    function sellExactOutLimited(address trader, uint256 ethOut, uint160 limit) internal returns (BalanceDelta) {
+        vm.startPrank(trader, trader);
+        BalanceDelta delta = swapRouter.swap(
+            key,
+            SwapParams({zeroForOne: false, amountSpecified: int256(ethOut), sqrtPriceLimitX96: limit}),
+            PoolSwapTest.TestSettings({takeClaims: false, settleUsingBurn: false}),
+            ""
+        );
+        vm.stopPrank();
+        return delta;
+    }
+
+    function currentSqrtPrice() internal view returns (uint160 sqrtPriceX96) {
+        (sqrtPriceX96,,,) = StateLibrary.getSlot0(manager, poolId);
     }
 
     function removeFullRangeLiquidity(address provider, uint128 liquidity) internal {
